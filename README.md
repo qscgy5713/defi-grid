@@ -16,9 +16,11 @@ Base 鏈上 **Uniswap v3** 的網格交易**唯讀分析與模擬**工具。目�
 不需要安裝任何套件。
 
 ```bash
-cd ~/www/defi-grid
+git clone https://github.com/qscgy5713/defi-grid.git   # 已設定 SSH 金鑰可改用 git@github.com:qscgy5713/defi-grid.git
+cd defi-grid
 python3 -m unittest discover -s tests     # 跑測試
 ```
+之後的指令都在專案根目錄(`defi-grid/`)執行。
 
 公開節點有速率限制;若常被限流,可改用自己的節點(金鑰只放環境變數,**不要寫進程式碼或提交到 git**):
 ```bash

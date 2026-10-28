@@ -1,5 +1,9 @@
 # 工作日誌
 
+## 2026-10-28(發佈到 GitHub)
+- 建立公開 repo https://github.com/qscgy5713/defi-grid,remote 用 SSH;推送前檢查過沒有金鑰或個人資料,`paper/`、`cache/` 不上傳
+- README 安裝步驟改成 `git clone`(用 HTTPS 網址,未設定 SSH 金鑰的人也能下載)
+
 ## 2026-10-28(即時模擬盤)
 - 使用者想讓模擬自動跑。新增 `paper.py` 與 `paper run / status / list`:用鏈上逐筆成交即時推進網格,狀態存檔、可接續,不碰錢包
 - 重構:`simulate` 內的邏輯抽成 `GridEngine`(含存檔 / 讀檔),回測結果與重構前完全相同($939.29、11 次循環)
