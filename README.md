@@ -1,6 +1,6 @@
 # defi-grid
 
-Base 鏈上 **Uniswap v3** 的網格交易**唯讀分析與模擬**工具。目前是路線圖的**階段 1~2**:讀鏈上資料、用歷史價格回測,
+Base 鏈上 **Uniswap v3**(ETH)與 Sui 鏈上 **Cetus**(SUI)的網格交易**唯讀分析與模擬**工具。目前是路線圖的**階段 1~2**:讀鏈上資料、用歷史價格回測,
 把手續費、滑點、價格衝擊與 gas 都算進成本,回答「這組網格參數扣完成本還賺不賺」。
 
 > **這個專案不碰錢包。** 沒有任何簽章、私鑰、API 金鑰或送出交易的程式碼,全部是唯讀。
@@ -9,7 +9,7 @@ Base 鏈上 **Uniswap v3** 的網格交易**唯讀分析與模擬**工具。目�
 ## 技術棧
 - Python 3.9+,**只用標準庫**(`urllib`、`json`、`unittest`),無第三方依賴
 - 鏈上資料:Base 公開 RPC(預設 `https://mainnet.base.org`),自己用 `eth_call` 解 ABI,不依賴 web3 函式庫
-- 歷史價格:GeckoTerminal 公開 API(免金鑰),取池子每小時 OHLCV,快取在 `cache/`
+- 歷史價格:GeckoTerminal 公開 API(免金鑰),取池子每小時 OHLCV,快取在 `cache/`;支援 Base 與 Sui(`--chain sui`)
 - 逐筆成交:鏈上 Swap 事件(`eth_getLogs`)。`mainnet.base.org` 不支援這種查詢,`swaps` 指令預設改用 `https://base-rpc.publicnode.com`
 
 ## 安裝與環境設定
@@ -52,6 +52,13 @@ python3 -m defigrid scan --days 90 --grids-list 5,10,20,40 --ranges 5,10,15,20
 # 6. 滾動式驗證:每輪用過去 30 天挑出最佳參數,拿接下來 7 天實跑,再往後推 7 天,反覆到最新資料
 python3 -m defigrid walk --days 120 --train-days 30 --test-days 7 --grids-list 5,10,20,40 --ranges 5,10,15,20
 ```
+```bash
+# SUI:backtest / scan / walk 加 --chain sui(Sui 鏈 Cetus USDC/SUI 0.05%,預設 gas $0.01)
+python3 -m defigrid backtest --chain sui --days 30 --grids 20 --range-pct 20
+python3 -m defigrid walk --chain sui --days 120 --grids-list 10,20,40 --ranges 10,20,30
+```
+SUI 支援 K 線回測與即時模擬盤(`paper run --chain sui`,見下方);`swaps`、`lp`、`pool`、`gas` 只支援 Base。
+
 `walk` 比 `scan` 的單一切點更不靠運氣。它會列出每一輪選中的參數與樣本外結果,並把各輪連乘成整體報酬,
 再跟兩個對照比較:同期持有幣,以及「整段固定用同一組參數」的中位數。
 挑出來的參數如果沒有明顯勝過中位數,就代表「看過去挑參數」沒有用。
@@ -72,7 +79,11 @@ python3 -m defigrid lp --days 30 --range-pct 10 --grids 20
 # 建立並開始跑(以目前價格 ±20%、20 格、本金 1000;每 15 秒檢查一次,Ctrl+C 停止)
 python3 -m defigrid paper run --name eth20 --range-pct 20 --grids 20 --capital 1000
 
-# 之後接續(會從上次停下的區塊補抓,設定沿用建立時的)
+# SUI(Sui 鏈 Cetus USDC/SUI 0.05%;加 caffeinate -is 防止 Mac 睡眠,tee 同時存一份記錄)
+mkdir -p paper
+caffeinate -is python3 -u -m defigrid paper run --chain sui --name sui20 --range-pct 20 --grids 20 --capital 1000 | tee -ai paper/sui20.log
+
+# 之後接續(會從上次停下的區塊補抓,鏈與設定都沿用建立時的)
 python3 -m defigrid paper run --name eth20
 
 # 查看狀態與最近成交(不連網);列出所有模擬盤
@@ -83,7 +94,10 @@ python3 -m defigrid paper list
 mkdir -p paper && nohup python3 -u -m defigrid paper run --name eth20 > paper/eth20.log 2>&1 &
 ```
 - 狀態存在 `paper/<名稱>.json`,成交記錄在 `paper/<名稱>.trades.jsonl`(`paper/` 已被 .gitignore 排除)。
-- 電腦睡眠或關機後再執行會自動補抓;停機超過 48 小時只補最近 48 小時,中間那段會漏算並在狀態中提示。
+- 電腦睡眠或關機後再執行會自動補抓;停機超過上限只補最近一段,中間那段會漏算並在狀態中提示。
+  上限:Base 48 小時;Sui **2 小時**(Sui 要從整個 Cetus 的成交裡篩出這個池子,補抓 2 小時約需 3 分鐘)。
+- Sui 讀取用官方 GraphQL(`https://graphql.mainnet.sui.io/graphql`,公開節點已停用 JSON-RPC),
+  可用 `--rpc` 或環境變數 `SUI_GRAPHQL_URL` 換節點;每輪只處理到最新 checkpoint 往前約 5 秒,避免索引延遲漏抓。
 - 想換設定就用新的 `--name` 另開一個,可以同時跑好幾組比較。
 - 也可以用 `--once` 只更新一次,搭配排程定時執行。
 
@@ -111,14 +125,15 @@ defi-grid/
 ├── defigrid/
 │   ├── rpc.py       # 唯讀 JSON-RPC(錯誤訊息不外洩含金鑰的網址)
 │   ├── uniswap.py   # 池子狀態、ABI 解碼、價格與價格衝擊
-│   ├── data.py      # 歷史 K 線(取得、驗證、快取)
+│   ├── data.py      # 歷史 K 線(取得、驗證、快取)、各鏈預設池子(CHAINS)
 │   ├── sim.py       # 網格模擬引擎與損益估算(純計算)
 │   ├── scan.py      # 參數掃描、樣本內 / 樣本外驗證、排名相關性、滾動式驗證
 │   ├── swaps.py     # 鏈上 Swap 事件(逐筆成交價格)
 │   ├── lp.py        # Uniswap v3 集中流動性部位模擬
-│   ├── paper.py     # 即時模擬盤(狀態保存、斷點接續)
+│   ├── sui.py       # Sui GraphQL:Cetus 池子狀態與逐筆成交
+│   ├── paper.py     # 即時模擬盤(Base / Sui,狀態保存、斷點接續)
 │   └── cli.py       # 命令列
-├── tests/           # 單元測試(75 項,不需連網)
+├── tests/           # 單元測試(87 項,不需連網)
 ├── paper/           # 模擬盤狀態與成交記錄(已被 .gitignore 排除)
 ├── cache/           # K 線快取(已被 .gitignore 排除)
 └── doc/             # 文件

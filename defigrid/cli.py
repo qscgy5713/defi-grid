@@ -7,12 +7,13 @@ import time
 import unicodedata
 
 from . import __version__
-from .data import DataError, fetch_candles, suspicious
+from .data import CHAINS, DataError, check_ids, check_pool, fetch_candles, suspicious
 from . import paper
 from .lp import LpConfig, human_liquidity, simulate_lp
 from .rpc import Rpc, RpcError
 from .scan import hodl_pct, scan, summarize, walk_forward, walk_summary
 from .sim import CostModel, GridConfig, Trade, economics, grid_lines, simulate
+from .sui import SuiClient, read_pool as sui_read_pool
 from .swaps import LOGS_RPC, MAX_HOURS, as_candles, as_ticks, fetch_swaps
 from .uniswap import POOL_WETH_USDC_500, WETH_BASE, l1_fee_upper_bound, price_impact, price_token1_per_token0, read_pool
 
@@ -21,6 +22,11 @@ DISCLAIMER = "※ 這是模擬與分析工具,不構成投資建議;模擬結果
 
 def _pct(x):
     return f"{x:+.2f}%"
+
+
+def _usd(x):
+    """價格:低價幣(例如 SUI 約 $0.9)多顯示幾位小數,否則格線都會變成同一個數字。"""
+    return f"${x:,.2f}" if x >= 100 else f"${x:,.4f}"
 
 
 def _ts(t):
@@ -89,8 +95,8 @@ def cmd_economics(args):
     cfg = GridConfig(args.lower, args.upper, args.grids, args.capital, args.mode)
     e = economics(cfg, _costs(args), price)
     lines = grid_lines(cfg)
-    print(f"參考價格 ${price:,.2f}    區間 ${cfg.lower:,.0f} ~ ${cfg.upper:,.0f}    {cfg.grids} 格({cfg.mode})")
-    print(f"格距約 {e['spacing_pct']:.3f}%(${lines[1] - lines[0]:,.2f} 起)    每格資金 ${e['grid_value']:,.2f}")
+    print(f"參考價格 {_usd(price)}    區間 {_usd(cfg.lower)} ~ {_usd(cfg.upper)}    {cfg.grids} 格({cfg.mode})")
+    print(f"格距約 {e['spacing_pct']:.3f}%({_usd(lines[1] - lines[0])} 起)    每格資金 ${e['grid_value']:,.2f}")
     print(f"每筆單邊成本 {e['cost_rate_pct']:.3f}%(手續費+滑點),另加每筆 gas ${args.gas_usd}")
     print(f"每個完整買賣循環:淨 ${e['net_per_cycle_usd']:+.4f}({_pct(e['net_per_cycle_pct'])} 每格資金)")
     if e["viable"]:
@@ -104,8 +110,11 @@ def cmd_economics(args):
 def cmd_backtest(args):
     if (args.lower is None) != (args.upper is None):
         raise ValueError("--lower 與 --upper 必須一起給(或都不給,改用 --range-pct)")
+    if args.live_impact and args.chain != "base":
+        raise ValueError("--live-impact 只支援 Base(要讀 Uniswap v3 池子的鏈上流動性)")
     GridConfig(1.0, 2.0, args.grids, args.capital, args.mode)  # 先驗證格數、本金等參數,避免白白下載
-    candles = fetch_candles(args.pool, args.token, args.days, use_cache=not args.no_cache)
+    _resolve_chain(args)
+    candles = _candles(args)
     p0 = candles[0].open
     if args.lower is not None and args.upper is not None:
         lower, upper = args.lower, args.upper
@@ -117,9 +126,9 @@ def cmd_backtest(args):
     r = simulate(candles, cfg, costs, args.path)
     e = economics(cfg, costs, p0)
 
-    print(f"期間:{_ts(candles[0].ts)} ~ {_ts(candles[-1].ts)} UTC({len(candles)} 根小時 K 線)")
-    print(f"價格:${r.start_price:,.2f} → ${r.end_price:,.2f}({_pct(r.hodl_pct)})")
-    print(f"網格:${cfg.lower:,.2f} ~ ${cfg.upper:,.2f}  {cfg.grids} 格({cfg.mode})  本金 ${cfg.capital:,.2f}  格距約 {e['spacing_pct']:.3f}%")
+    print(f"{_chain_label(args)}    期間:{_ts(candles[0].ts)} ~ {_ts(candles[-1].ts)} UTC({len(candles)} 根小時 K 線)")
+    print(f"價格:{_usd(r.start_price)} → {_usd(r.end_price)}({_pct(r.hodl_pct)})")
+    print(f"網格:{_usd(cfg.lower)} ~ {_usd(cfg.upper)}  {cfg.grids} 格({cfg.mode})  本金 ${cfg.capital:,.2f}  格距約 {e['spacing_pct']:.3f}%")
     print(f"成本假設:手續費 {args.fee_bps}bp + 滑點 {args.slippage_bps}bp"
           + (" + 池子價格衝擊" if state else "") + f",每筆 gas ${args.gas_usd}    K 線路徑:{args.path}")
     print("-" * 56)
@@ -142,6 +151,26 @@ def cmd_backtest(args):
     return 0
 
 
+def _resolve_chain(args):
+    """沒給 --pool / --token / --gas-usd 時,用所選鏈的預設值,並先驗證格式(避免白白下載)。"""
+    c = CHAINS[args.chain]
+    args.pool = args.pool or c["pool"]
+    args.token = args.token or c["token"]
+    if args.gas_usd is None:
+        args.gas_usd = c["gas_usd"]
+    check_ids(args.chain, args.pool, args.token)
+
+
+def _candles(args):
+    return fetch_candles(args.pool, args.token, args.days, use_cache=not args.no_cache, chain=args.chain)
+
+
+def _chain_label(args):
+    c = CHAINS[args.chain]
+    default = (args.pool.lower(), args.token.lower()) == (c["pool"].lower(), c["token"].lower())
+    return c["label"] if default else f"{args.chain} 自訂池子 {args.pool}"
+
+
 def _check_grid_lists(args):
     # 先驗證所有參數,避免下載完資料才報錯
     for g in args.grids_list:
@@ -156,11 +185,13 @@ def cmd_scan(args):
         raise ValueError("--train 必須介於 0 與 1 之間(1 = 不做樣本外驗證)")
     if args.top < 1:
         raise ValueError("--top 必須至少為 1")
-    candles = fetch_candles(args.pool, args.token, args.days, use_cache=not args.no_cache)
+    _resolve_chain(args)
+    candles = _candles(args)
     costs = _costs(args)
     rows, train, test = scan(candles, args.grids_list, args.ranges, args.capital, costs, args.mode, args.path, args.train)
     info = summarize(rows)
 
+    print(_chain_label(args))
     print(f"樣本內:{_ts(train[0].ts)} ~ {_ts(train[-1].ts)} UTC({len(train)} 根)  幣價 {_pct(hodl_pct(train))}")
     if test:
         print(f"樣本外:{_ts(test[0].ts)} ~ {_ts(test[-1].ts)} UTC({len(test)} 根)  幣價 {_pct(hodl_pct(test))}")
@@ -213,12 +244,14 @@ def cmd_walk(args):
         raise ValueError("--days 必須介於 1 到 120")
     if args.train_days + args.test_days > args.days:
         raise ValueError(f"--train-days + --test-days({args.train_days + args.test_days} 天)不能超過 --days({args.days} 天)")
-    candles = fetch_candles(args.pool, args.token, args.days, use_cache=not args.no_cache)
+    _resolve_chain(args)
+    candles = _candles(args)
     folds = walk_forward(candles, args.grids_list, args.ranges, args.capital, _costs(args), args.mode, args.path,
                          args.train_days * 24, args.test_days * 24, args.anchored)
     s = walk_summary(folds)
 
     window = "擴張視窗(樣本內從頭累積)" if args.anchored else f"滾動視窗(樣本內固定 {args.train_days} 天)"
+    print(_chain_label(args))
     print(f"滾動式驗證:{s['folds']} 輪,每輪用過去資料挑出樣本內最佳參數,再拿接下來 {args.test_days} 天實跑  {window}")
     print(f"樣本外合計:{_ts(folds[0].test_start)} ~ {_ts(folds[-1].test_end)} UTC    每輪從 {s['combos']} 組中挑選")
     print(f"本金 ${args.capital:,.0f}  {args.mode}  成本:手續費 {args.fee_bps}bp + 滑點 {args.slippage_bps}bp,每筆 gas ${args.gas_usd}")
@@ -334,17 +367,24 @@ def cmd_lp(args):
     return 0
 
 
-def _paper_rpc(args):
-    return Rpc(args.rpc or os.environ.get("BASE_RPC_URL") or LOGS_RPC)
+def _paper_client(chain, rpc):
+    if chain == "sui":
+        return SuiClient(rpc)
+    return Rpc(rpc or os.environ.get("BASE_RPC_URL") or LOGS_RPC)
+
+
+def _block_word(chain):
+    return "checkpoint" if chain == "sui" else "區塊"
 
 
 def _paper_summary(p):
     e = p.engine
     in_range = p.cfg.lower <= p.last_price <= p.cfg.upper
     hours = (p.last_ts - p.started_ts) / 3600
-    print(f"模擬盤「{p.name}」  {p.symbol0}/{p.symbol1}  已跑 {hours:.1f} 小時(開始 {_ts(p.started_ts)} UTC)")
-    print(f"網格:${p.cfg.lower:,.2f} ~ ${p.cfg.upper:,.2f}  {p.cfg.grids} 格({p.cfg.mode})  本金 ${p.cfg.capital:,.2f}")
-    print(f"價格:${p.start_price:,.2f} → ${p.last_price:,.2f}({_pct(p.hodl_pct())})"
+    print(f"模擬盤「{p.name}」  {p.symbol0}/{p.symbol1}({CHAINS[p.chain]['name']})"
+          f"  已跑 {hours:.1f} 小時(開始 {_ts(p.started_ts)} UTC)")
+    print(f"網格:{_usd(p.cfg.lower)} ~ {_usd(p.cfg.upper)}  {p.cfg.grids} 格({p.cfg.mode})  本金 ${p.cfg.capital:,.2f}")
+    print(f"價格:{_usd(p.start_price)} → {_usd(p.last_price)}({_pct(p.hodl_pct())})"
           + ("" if in_range else "  ⚠ 目前在網格區間外"))
     print(f"資產:${p.equity():,.2f}  報酬 {_pct(p.return_pct())}(持幣以現價計)    全部賣回 USDC:{_pct(p.exit_return_pct())}")
     print(f"持有 {e.base:.6f} {p.symbol0} + {e.quote:,.2f} {p.symbol1}    最大回撤 {p.max_drawdown * 100:.2f}%")
@@ -353,61 +393,78 @@ def _paper_summary(p):
     print(f"已實現網格獲利 ${e.realized_profit:+,.2f}    未實現損益 ${e.unrealized_pnl(p.last_price):+,.2f}    "
           f"交易成本 ${e.trading_cost:,.2f}  gas ${e.gas_paid:,.2f}")
     if p.gaps:
-        print(f"⚠ 曾有 {p.gaps} 次停機超過 {MAX_HOURS} 小時,中間那段只能當作價格直接走過去,會漏算成交。")
+        h = paper.catchup_hours(p.chain)
+        print(f"⚠ 曾有 {p.gaps} 次停機超過 {h} 小時,中間那段只能當作價格直接走過去,會漏算成交。")
 
 
 def _print_trade(t, symbol0):
     side = "買入" if t.side == "buy" else "賣出"
-    print(f"  {_ts(t.ts)}  {side} {t.qty:.6f} {symbol0} @ ${t.price:,.2f}(格子 {t.cell})")
+    print(f"  {_ts(t.ts)}  {side} {t.qty:.6f} {symbol0} @ {_usd(t.price)}(格子 {t.cell})")
 
 
 def cmd_paper_run(args):
     if args.interval < 5:
         raise ValueError("--interval 至少 5 秒(公開節點有速率限制)")
     creating = not paper.exists(args.name)
-    given = [k for k in ("grids", "capital", "mode", "range_pct", "lower", "upper", "fee_bps", "slippage_bps", "gas_usd")
+    given = [k for k in ("chain", "pool", "grids", "capital", "mode", "range_pct", "lower", "upper",
+                         "fee_bps", "slippage_bps", "gas_usd")
              if getattr(args, k) is not None]
     if creating:
+        chain = args.chain or "base"
         if (args.lower is None) != (args.upper is None):
             raise ValueError("--lower 與 --upper 必須一起給(或都不給,改用 --range-pct)")
         if args.lower is None and not 0 < (args.range_pct or 10.0) < 100:
             raise ValueError("--range-pct 必須介於 0 與 100 之間")
         GridConfig(1.0, 2.0, args.grids or 20, args.capital or 1000.0, args.mode or "arithmetic")  # 先驗證參數
-    rpc = _paper_rpc(args)
-    if creating:
-        state = read_pool(rpc, args.pool)
+        pool = check_pool(chain, args.pool or CHAINS[chain]["pool"])
+        client = _paper_client(chain, args.rpc)
+        state = sui_read_pool(client, pool) if chain == "sui" else read_pool(client, pool)
         costs = CostModel(fee_rate=(5.0 if args.fee_bps is None else args.fee_bps) / 10_000,
                           slippage_rate=(2.0 if args.slippage_bps is None else args.slippage_bps) / 10_000,
-                          gas_usd=0.03 if args.gas_usd is None else args.gas_usd)
+                          gas_usd=CHAINS[chain]["gas_usd"] if args.gas_usd is None else args.gas_usd)
         cfg_args = {"grids": args.grids or 20, "capital": args.capital or 1000.0, "mode": args.mode or "arithmetic",
                     "range_pct": args.range_pct or 10.0, "lower": args.lower, "upper": args.upper}
-        p = paper.create(args.name, state, cfg_args, costs)
-        print(f"已建立模擬盤「{p.name}」,以目前價格 ${p.start_price:,.2f} 建倉(區塊 {p.last_block})")
+        p = paper.create(args.name, state, cfg_args, costs, chain)
+        print(f"已建立模擬盤「{p.name}」,以目前價格 {_usd(p.start_price)} 建倉({_block_word(chain)} {p.last_block})")
+        if chain == "sui" and abs(state.fee_rate * 10_000 - costs.fee_rate * 10_000) > 0.01:
+            print(f"⚠ 池子手續費是 {state.fee_rate * 10_000:g}bp,但 --fee-bps 用的是 {costs.fee_rate * 10_000:g}bp")
     else:
         p = paper.load(args.name)
         if given:
             print(f"(模擬盤「{p.name}」已存在,沿用原本的設定,忽略 {', '.join('--' + k.replace('_', '-') for k in given)})")
-        print(f"接續模擬盤「{p.name}」,從區塊 {p.last_block + 1} 開始補抓")
+        client = _paper_client(p.chain, args.rpc)
+        print(f"接續模擬盤「{p.name}」,從{_block_word(p.chain)} {p.last_block + 1} 開始補抓")
     _paper_summary(p)
     print(DISCLAIMER)
     if not args.once:
         print(f"每 {args.interval:g} 秒檢查一次新成交,按 Ctrl+C 停止(狀態會保存,之後可接續)")
 
-    polls = 0
+    polls, shown = 0, [False]
+
+    def progress(x):
+        # 只有補抓一大段時才顯示(一般輪詢一頁或一段就抓完)
+        if x < 1 or shown[0]:
+            shown[0] = True
+            print(f"\r補抓成交 {x * 100:5.1f}%", end="", file=sys.stderr, flush=True)
+
     try:
         while True:
             try:
-                new, n_swaps, gap = paper.step(p, rpc)
+                new, n_swaps, gap = paper.step(p, client, progress)
             except RpcError as e:
                 print(f"{_ts(time.time())}  ⚠ 讀取失敗,下次再試: {e}", file=sys.stderr)
                 new, n_swaps, gap = [], 0, False
+            if shown[0]:  # 補抓進度列換行
+                print(file=sys.stderr)
+                shown[0] = False
             if gap:
-                print(f"⚠ 停機超過 {MAX_HOURS} 小時,只補抓最近 {MAX_HOURS} 小時,中間那段會漏算成交。")
+                h = paper.catchup_hours(p.chain)
+                print(f"⚠ 停機超過 {h} 小時,只補抓最近 {h} 小時,中間那段會漏算成交。")
             for t in new:
                 _print_trade(t, p.symbol0)
             polls += 1
             if new or args.once or polls % args.status_every == 0:
-                print(f"{_ts(p.last_ts)}  價格 ${p.last_price:,.2f}  資產 ${p.equity():,.2f}({_pct(p.return_pct())})"
+                print(f"{_ts(p.last_ts)}  價格 {_usd(p.last_price)}  資產 ${p.equity():,.2f}({_pct(p.return_pct())})"
                       f"  持有幣 {_pct(p.hodl_pct())}  循環 {p.sells}  本輪 {n_swaps} 筆鏈上成交")
             if args.once:
                 return 0
@@ -443,7 +500,8 @@ def cmd_paper_list(args):
         except ValueError as e:
             rows.append([n, "存檔損毀", "", "", "", str(e)[:30]])
             continue
-        rows.append([n, f"${p.cfg.lower:,.0f}~${p.cfg.upper:,.0f} {p.cfg.grids} 格", f"${p.cfg.capital:,.0f}",
+        lo, hi = (f"${x:,.0f}" if x >= 100 else _usd(x) for x in (p.cfg.lower, p.cfg.upper))
+        rows.append([n, f"{p.symbol0} {lo}~{hi} {p.cfg.grids} 格", f"${p.cfg.capital:,.0f}",
                      _pct(p.return_pct()), _pct(p.hodl_pct()), _ts(p.last_ts)])
     _table(["名稱", "設定", "本金", "報酬", "持有幣", "最後更新 (UTC)"], rows, left=(0, 1))
     return 0
@@ -488,10 +546,21 @@ def _add_common(p):
     p.add_argument("--pool", default=POOL_WETH_USDC_500, help="Uniswap v3 池子位址(預設 Base 的 WETH/USDC 0.05%%)")
 
 
-def _add_costs(p):
+def _add_chain(p):
+    """可切換鏈的指令(只用 K 線,不讀鏈上狀態):--chain 決定預設池子、代幣與 gas。"""
+    p.add_argument("--chain", choices=sorted(CHAINS), default="base",
+                   help="哪條鏈(預設 base = WETH/USDC;sui = Cetus 上的 SUI/USDC)")
+    p.add_argument("--rpc", help="Base RPC 網址(只有 --live-impact 會用到)")
+    p.add_argument("--pool", help="池子位址(Base)或物件 ID(Sui);預設依 --chain")
+    p.add_argument("--token", help="要看價格的代幣:Base 用位址,Sui 用 coin type;預設依 --chain")
+
+
+def _add_costs(p, gas_default=0.03):
     p.add_argument("--fee-bps", type=_nonneg, default=5.0, help="池子手續費,單位 bp(預設 5 = 0.05%%)")
     p.add_argument("--slippage-bps", type=_nonneg, default=2.0, help="額外滑點假設(bp)")
-    p.add_argument("--gas-usd", type=_nonneg, default=0.03, help="每筆交易的 gas(美元);用 gas 指令實測後校準")
+    gas_help = "每筆交易的 gas(美元);用 gas 指令實測後校準" if gas_default is not None else \
+        "每筆交易的 gas(美元);預設 Base 0.03、Sui 0.01"
+    p.add_argument("--gas-usd", type=_nonneg, default=gas_default, help=gas_help)
 
 
 def _add_grid(p):
@@ -501,7 +570,7 @@ def _add_grid(p):
 
 
 def build_parser():
-    ap = argparse.ArgumentParser(prog="defigrid", description="Base 鏈 Uniswap v3 網格交易的唯讀分析與模擬")
+    ap = argparse.ArgumentParser(prog="defigrid", description="Base(Uniswap v3)/ Sui(Cetus)網格交易的唯讀分析與模擬")
     ap.add_argument("--version", action="version", version=__version__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -525,10 +594,9 @@ def build_parser():
     p.set_defaults(fn=cmd_economics)
 
     p = sub.add_parser("backtest", help="用歷史 K 線回測網格")
-    _add_common(p)
+    _add_chain(p)
     _add_grid(p)
-    _add_costs(p)
-    p.add_argument("--token", default=WETH_BASE, help="要看價格的代幣位址(預設 WETH)")
+    _add_costs(p, gas_default=None)
     p.add_argument("--days", type=int, default=30, help="回測最近幾天(1~120)")
     p.add_argument("--lower", type=_positive, help="區間下界(與 --upper 一起給)")
     p.add_argument("--upper", type=_positive, help="區間上界")
@@ -539,9 +607,8 @@ def build_parser():
     p.set_defaults(fn=cmd_backtest)
 
     p = sub.add_parser("scan", help="一次回測多組格數 × 區間,並用樣本外資料驗證")
-    _add_common(p)
-    _add_costs(p)
-    p.add_argument("--token", default=WETH_BASE, help="要看價格的代幣位址(預設 WETH)")
+    _add_chain(p)
+    _add_costs(p, gas_default=None)
     p.add_argument("--days", type=int, default=60, help="使用最近幾天的資料(1~120)")
     p.add_argument("--grids-list", type=_list_of(int, "--grids-list"), default=[5, 10, 15, 20, 30, 40], help="要試的格數,逗號分隔")
     p.add_argument("--ranges", type=_list_of(float, "--ranges"), default=[5.0, 10.0, 15.0, 20.0], help="要試的區間 ±百分比,逗號分隔")
@@ -554,9 +621,8 @@ def build_parser():
     p.set_defaults(fn=cmd_scan)
 
     p = sub.add_parser("walk", help="滾動式驗證:反覆用過去挑參數、用接下來的資料驗證")
-    _add_common(p)
-    _add_costs(p)
-    p.add_argument("--token", default=WETH_BASE, help="要看價格的代幣位址(預設 WETH)")
+    _add_chain(p)
+    _add_costs(p, gas_default=None)
     p.add_argument("--days", type=int, default=120, help="使用最近幾天的資料(1~120)")
     p.add_argument("--train-days", type=_positive_int, default=30, help="每輪用來挑參數的天數")
     p.add_argument("--test-days", type=_positive_int, default=7, help="每輪驗證的天數(也是往後推進的天數)")
@@ -595,8 +661,10 @@ def build_parser():
     psub = pp.add_subparsers(dest="paper_cmd", required=True)
     p = psub.add_parser("run", help="建立或接續一個模擬盤,持續追蹤新成交")
     p.add_argument("--name", required=True, help="模擬盤名稱(小寫英數字、- 與 _)")
-    p.add_argument("--rpc", help=f"支援 eth_getLogs 的 Base RPC(預設讀 BASE_RPC_URL,否則用 {LOGS_RPC})")
-    p.add_argument("--pool", default=POOL_WETH_USDC_500, help="Uniswap v3 池子位址(預設 Base 的 WETH/USDC 0.05%%)")
+    p.add_argument("--chain", choices=sorted(CHAINS), help="哪條鏈(建立時用,預設 base;sui = Cetus SUI/USDC)")
+    p.add_argument("--rpc", help=f"Base:支援 eth_getLogs 的 RPC(預設 BASE_RPC_URL 或 {LOGS_RPC});"
+                                 "Sui:GraphQL 網址(預設 SUI_GRAPHQL_URL 或官方公開節點)")
+    p.add_argument("--pool", help="池子(建立時用):Base 是 Uniswap v3 位址,Sui 是 Cetus 池子物件 ID;預設依 --chain")
     p.add_argument("--grids", type=int, help="格數(建立時用,預設 20)")
     p.add_argument("--capital", type=_positive, help="本金 USDC(建立時用,預設 1000)")
     p.add_argument("--mode", choices=("arithmetic", "geometric"), help="等差或等比網格(建立時用)")

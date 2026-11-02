@@ -9,14 +9,21 @@ import re
 import time
 from dataclasses import dataclass
 
+from . import sui
+from .data import check_pool
 from .sim import CostModel, GridConfig, GridEngine
 from .swaps import BLOCK_TIME, MAX_HOURS, fetch_range, latest_head
-from .uniswap import check_address, price_token1_per_token0
+from .uniswap import price_token1_per_token0
 
 STATE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "paper")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 MAX_CATCHUP_BLOCKS = MAX_HOURS * 3600 // BLOCK_TIME  # 停機太久時,最多補抓這麼多區塊
-VERSION = 1
+VERSION = 1  # 新增欄位(chain、invert)都有預設值,舊存檔照樣能讀
+
+
+def catchup_hours(chain):
+    """停機後最多補抓幾小時。"""
+    return sui.MAX_CATCHUP_SECONDS // 3600 if chain == "sui" else MAX_HOURS
 
 
 def check_name(name):
@@ -51,6 +58,8 @@ class Paper:
     peak: float = 0.0
     max_drawdown: float = 0.0
     gaps: int = 0  # 停機太久、只能補抓最近一段的次數
+    chain: str = "base"  # base:last_block 是區塊號;sui:last_block 是 checkpoint
+    invert: bool = False  # sui:要買賣的幣是池子的 coin_b(見 sui.SuiPool)
 
     def equity(self):
         return self.engine.equity(self.last_price)
@@ -87,6 +96,8 @@ class Paper:
             "peak": self.peak,
             "max_drawdown": self.max_drawdown,
             "gaps": self.gaps,
+            "chain": self.chain,
+            "invert": self.invert,
         }
 
     @classmethod
@@ -96,14 +107,16 @@ class Paper:
         cfg = GridConfig(**d["config"])
         costs = CostModel(**d["costs"])
         s0, s1, d0, d1 = d["tokens"]
+        chain = d.get("chain", "base")
         return cls(
-            name=check_name(d["name"]), pool=check_address(d["pool"]), symbol0=s0, symbol1=s1,
+            name=check_name(d["name"]), pool=check_pool(chain, d["pool"]), symbol0=s0, symbol1=s1,
             decimals0=int(d0), decimals1=int(d1), cfg=cfg, costs=costs,
             engine=GridEngine.from_dict(cfg, costs, d["engine"]),
             started_ts=int(d["started_ts"]), start_price=float(d["start_price"]),
             last_block=int(d["last_block"]), last_ts=int(d["last_ts"]), last_price=float(d["last_price"]),
             buys=int(d["buys"]), sells=int(d["sells"]), peak=float(d["peak"]),
             max_drawdown=float(d["max_drawdown"]), gaps=int(d.get("gaps", 0)),
+            chain=chain, invert=bool(d.get("invert", False)),
         )
 
 
@@ -146,11 +159,12 @@ def read_trades(name, limit=None):
     return rows[-limit:] if limit else rows
 
 
-def create(name, state, cfg_args, costs):
-    """以池子目前價格建立新的模擬盤。cfg_args:grids、capital、mode,以及 range_pct 或 lower / upper。"""
+def create(name, state, cfg_args, costs, chain="base"):
+    """以池子目前價格建立新的模擬盤。cfg_args:grids、capital、mode,以及 range_pct 或 lower / upper。
+    state:Base 是 uniswap.read_pool 的結果,Sui 是 sui.read_pool 的結果。"""
     if exists(name):
         raise ValueError(f"模擬盤「{name}」已存在")
-    price = price_token1_per_token0(state)
+    price = state.price if chain == "sui" else price_token1_per_token0(state)
     if cfg_args.get("lower") is not None:
         lower, upper = cfg_args["lower"], cfg_args["upper"]
     else:
@@ -160,7 +174,8 @@ def create(name, state, cfg_args, costs):
     now = int(time.time())
     eng = GridEngine(cfg, costs, price, now)
     p = Paper(name, state.address, state.symbol0, state.symbol1, state.decimals0, state.decimals1, cfg, costs, eng,
-              started_ts=now, start_price=price, last_block=state.block, last_ts=now, last_price=price)
+              started_ts=now, start_price=price, last_block=state.block, last_ts=now, last_price=price,
+              chain=chain, invert=getattr(state, "invert", False))
     new = _take_trades(p)
     p.peak = p.equity()
     save(p)
@@ -176,16 +191,35 @@ def _take_trades(p):
     return new
 
 
-def step(p, rpc, progress=None):
-    """處理上次之後的新區塊。回傳 (新成交, 處理的 Swap 筆數, 是否因停機太久而跳過一段)。"""
-    latest_block, latest_ts = latest_head(rpc)
-    if latest_block <= p.last_block:
-        return [], 0, False
+def _fetch_new(p, client, progress):
+    """抓上次之後的新成交。回傳 (swaps, 最新區塊或 checkpoint, 時間戳, 是否跳過一段);沒有新資料回傳 None。"""
+    if p.chain == "sui":
+        latest, latest_ts = sui.latest_checkpoint(client)
+        if latest <= p.last_block:
+            return None
+        after = p.last_block
+        gap = latest_ts - p.last_ts > sui.MAX_CATCHUP_SECONDS
+        if gap:
+            after = max(after, latest - sui.MAX_CATCHUP_SECONDS * sui.CHECKPOINTS_PER_SEC)
+        since = latest_ts - sui.MAX_CATCHUP_SECONDS if gap else p.last_ts
+        return sui.fetch_swaps(client, _PoolRef(p), after, latest, since, latest_ts, progress), latest, latest_ts, gap
+    latest, latest_ts = latest_head(client)
+    if latest <= p.last_block:
+        return None
     start = p.last_block + 1
-    gap = latest_block - start + 1 > MAX_CATCHUP_BLOCKS
+    gap = latest - start + 1 > MAX_CATCHUP_BLOCKS
     if gap:
-        start = latest_block - MAX_CATCHUP_BLOCKS + 1
-    swaps = fetch_range(rpc, _PoolRef(p), start, latest_block, latest_block, latest_ts, progress)
+        start = latest - MAX_CATCHUP_BLOCKS + 1
+    return fetch_range(client, _PoolRef(p), start, latest, latest, latest_ts, progress), latest, latest_ts, gap
+
+
+def step(p, client, progress=None):
+    """處理上次之後的新區塊。回傳 (新成交, 處理的 Swap 筆數, 是否因停機太久而跳過一段)。
+    client:Base 用 rpc.Rpc,Sui 用 sui.SuiClient。"""
+    got = _fetch_new(p, client, progress)
+    if got is None:
+        return [], 0, False
+    swaps, latest_block, latest_ts, gap = got
     if gap:
         p.gaps += 1
     for s in swaps:
@@ -214,7 +248,7 @@ def _append(name, trades):
 
 
 class _PoolRef:
-    """fetch_range 需要的池子資訊(address、decimals)。"""
+    """fetch_range / sui.fetch_swaps 需要的池子資訊(address、decimals、invert)。"""
 
     def __init__(self, p):
-        self.address, self.decimals0, self.decimals1 = p.pool, p.decimals0, p.decimals1
+        self.address, self.decimals0, self.decimals1, self.invert = p.pool, p.decimals0, p.decimals1, p.invert

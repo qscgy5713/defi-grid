@@ -2,18 +2,63 @@
 import json
 import math
 import os
+import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from .sim import Candle
-from .uniswap import check_address
+from .uniswap import POOL_WETH_USDC_500, WETH_BASE, check_address
 
-API = "https://api.geckoterminal.com/api/v2/networks/base/pools/{pool}/ohlcv/hour"
+API = "https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool}/ohlcv/hour"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache")
 CACHE_TTL = 3600
 PAGE = 1000
 PAGE_DELAY = 2.5  # 公開 API 約每分鐘 30 次,分頁之間要等
+SUI_OBJECT_RE = re.compile(r"^0x[0-9a-fA-F]{1,64}$")
+SUI_COIN_RE = re.compile(r"^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$")
+
+# 各鏈的預設池子與代幣。Sui 不是 EVM 鏈:支援 K 線回測與即時模擬盤,不支援 pool / gas / swaps / lp
+CHAINS = {
+    "base": {
+        "name": "Base",
+        "network": "base",
+        "pool": POOL_WETH_USDC_500,
+        "token": WETH_BASE,
+        "gas_usd": 0.03,
+        "label": "Base Uniswap v3 WETH/USDC 0.05%",
+    },
+    "sui": {
+        "name": "Sui",
+        "network": "sui-network",
+        "pool": "0x51e883ba7c0b566a26cbc8a94cd33eb0abd418a77cc1e60ad22fd9b1f29cd2ab",
+        "token": "0x2::sui::SUI",
+        "gas_usd": 0.01,  # Sui 一次 swap 約 0.003~0.01 SUI,取寬鬆值
+        "label": "Sui Cetus USDC/SUI 0.05%",
+    },
+}
+
+
+def check_pool(chain, pool):
+    """依鏈驗證池子識別碼:Base 是 20 bytes 位址,Sui 是物件 ID。"""
+    if chain not in CHAINS:
+        raise ValueError(f"不支援的鏈: {chain}")
+    if chain == "base":
+        return check_address(pool)
+    if not SUI_OBJECT_RE.match(pool or ""):
+        raise ValueError(f"不是有效的 Sui 物件 ID: {pool!r}")
+    return pool
+
+
+def check_ids(chain, pool, token):
+    """驗證池子與代幣:Base 代幣是位址,Sui 代幣是 coin type(0x2::sui::SUI)。"""
+    check_pool(chain, pool)
+    if chain == "base":
+        return pool, check_address(token)
+    if not SUI_COIN_RE.match(token or ""):
+        raise ValueError(f"不是有效的 Sui coin type(例如 0x2::sui::SUI): {token!r}")
+    return pool, token
 
 
 class DataError(Exception):
@@ -64,14 +109,16 @@ def _get(url):
     raise DataError(f"取得 K 線失敗: {last}")
 
 
-def fetch_candles(pool, token, days, use_cache=True):
-    """取得最近 `days` 天的每小時 K 線。`token` 是要看價格的代幣位址(例如 WETH),以 USD 計價。"""
-    check_address(pool)
-    check_address(token)
+def fetch_candles(pool, token, days, use_cache=True, chain="base"):
+    """取得最近 `days` 天的每小時 K 線。`token` 是要看價格的代幣(例如 WETH),以 USD 計價。"""
+    check_ids(chain, pool, token)
     if not 1 <= days <= 120:
         raise ValueError("days 必須介於 1 到 120")
     need = days * 24
-    cache_file = os.path.join(CACHE_DIR, f"candles_{pool.lower()}_{token.lower()}.json")
+    key = f"{pool.lower()}_{token.lower()}"
+    if chain != "base":  # Base 沿用舊的快取檔名
+        key = f"{chain}_{pool.lower()}_{token.lower().replace(':', '-')}"
+    cache_file = os.path.join(CACHE_DIR, f"candles_{key}.json")
     cached = []
     if os.path.exists(cache_file) and time.time() - os.path.getmtime(cache_file) < CACHE_TTL:
         try:
@@ -87,7 +134,8 @@ def fetch_candles(pool, token, days, use_cache=True):
     rows, before = [], None
     while len(rows) < want:
         limit = min(PAGE, want - len(rows))
-        url = API.format(pool=pool) + f"?aggregate=1&limit={limit}&currency=usd&token={token}"
+        url = (API.format(network=CHAINS[chain]["network"], pool=pool)
+               + f"?aggregate=1&limit={limit}&currency=usd&token={urllib.parse.quote(token, safe='')}")
         if before:
             url += f"&before_timestamp={before}"
         page = _get(url).get("data", {}).get("attributes", {}).get("ohlcv_list") or []

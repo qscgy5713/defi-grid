@@ -59,6 +59,29 @@ class CliTests(unittest.TestCase):
                 with contextlib.redirect_stderr(io.StringIO()):
                     cli.main(argv)
 
+    def test_sui_chain_defaults_and_validation(self):
+        from tests.test_scan import series, zigzag
+
+        with mock.patch.object(cli, "fetch_candles", side_effect=AssertionError("不該連網")):
+            for argv, word in (
+                (["backtest", "--chain", "sui", "--live-impact"], "--live-impact"),
+                (["backtest", "--chain", "sui", "--token", "0x4200000000000000000000000000000000000006"], "coin type"),
+                (["scan", "--chain", "sui", "--pool", "nope"], "物件 ID"),
+            ):
+                code, _, err = run(argv)
+                self.assertEqual(code, 2, argv)
+                self.assertIn(word, err)
+        fake = mock.Mock(return_value=series(zigzag(0.9, 0.05, 24 * 5)))
+        with mock.patch.object(cli, "fetch_candles", fake):
+            code, out, _ = run(["backtest", "--chain", "sui", "--days", "5"])
+        self.assertEqual(code, 0)
+        sui = cli.CHAINS["sui"]
+        self.assertEqual(fake.call_args.args[:2], (sui["pool"], sui["token"]))
+        self.assertEqual(fake.call_args.kwargs["chain"], "sui")
+        self.assertIn("Cetus", out)
+        self.assertIn("每筆 gas $0.01", out)
+        self.assertIn("網格:$0.7650 ~ $0.9350", out)  # 低價幣顯示 4 位小數
+
     def test_walk_runs_offline(self):
         from tests.test_scan import series, zigzag
 

@@ -1,3 +1,4 @@
+import os
 import tempfile
 import time
 import unittest
@@ -33,6 +34,15 @@ class DataTests(unittest.TestCase):
         for pool, token, days in (("../etc", good, 5), (good, "0x1", 5), (good, good, 0), (good, good, 121)):
             with self.assertRaises(ValueError):
                 fetch_candles(pool, token, days)
+
+    def test_sui_ids_validated(self):
+        pool, coin = data.CHAINS["sui"]["pool"], data.CHAINS["sui"]["token"]
+        self.assertEqual(data.check_ids("sui", pool, coin), (pool, coin))
+        for p, t in (("../x", coin), (pool, "0x2::sui"), (pool, "0x2::sui::SUI&x=1"), (pool, POOL)):
+            with self.assertRaises(ValueError, msg=(p, t)):
+                data.check_ids("sui", p, t)
+        with self.assertRaises(ValueError):
+            data.check_ids("sol", pool, coin)
 
 
 POOL = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
@@ -72,6 +82,19 @@ class FetchTests(unittest.TestCase):
             fetch_candles(POOL, POOL, 1, use_cache=False)
         with mock.patch.object(data, "_get", side_effect=AssertionError("應該讀快取")):
             self.assertEqual(len(fetch_candles(POOL, POOL, 5)), 120)
+
+    def test_sui_url_and_separate_cache(self):
+        sui = data.CHAINS["sui"]
+        urls = []
+        api = fake_api(time.time())
+        with mock.patch.object(data, "_get", side_effect=lambda u: urls.append(u) or api(u)):
+            self.assertEqual(len(fetch_candles(sui["pool"], sui["token"], 1, chain="sui")), 24)
+        self.assertIn("/networks/sui-network/pools/", urls[0])
+        self.assertEqual(parse_qs(urlparse(urls[0]).query)["token"], ["0x2::sui::SUI"])  # :: 有編碼,解回來要一致
+        self.assertNotIn("::", urls[0])
+        names = os.listdir(self.tmp.name)
+        self.assertEqual(len(names), 1)
+        self.assertTrue(names[0].startswith("candles_sui_") and ":" not in names[0])
 
 
 if __name__ == "__main__":

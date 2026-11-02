@@ -1,5 +1,28 @@
 # 工作日誌
 
+## 2026-10-29(SUI 即時模擬盤)
+- 使用者選「讀 Sui 鏈上逐筆成交」(而不是每分鐘抓一次現價),和 ETH 盤一樣精準、可公平比較
+- Sui 公開節點已停用 JSON-RPC(回 `Method not found ... migrate to gRPC or GraphQL`)→ 新增 `sui.py` 用 GraphQL
+- 依事件類型 `<Cetus 套件>::pool::SwapEvent` 查詢再篩池子;改用 `affectedObject` 查交易不划算:很多交易只「讀」池子不成交
+- 實測:整個 Cetus 每 10 分鐘約 1,000 筆、這個池子約 60 筆;每頁 50 筆約 0.84 秒 → 停機補抓上限設 2 小時(約 3 分鐘)
+- 價格:Cetus sqrt_price 是 Q64.64 的 √(coin_b/coin_a);池子是 USDC/SUI,要買賣的 SUI 是 coin_b,所以取倒數(`invert`)。
+  實測解出 $0.9062,和 GeckoTerminal 一致
+- `paper.py`:新增 `chain`、`invert` 欄位(有預設值,舊存檔照樣能讀,正在跑的 eth10 不受影響);抓資料拆成 `_fetch_new` 依鏈分流
+- 寫完自我 code review:
+  - `Paper` 欄位叫 `pool` 不是 `address`,實跑才發現 → 改經過 `_PoolRef`
+  - 進度永遠到不了 100%,而且一般輪詢也會印進度列洗版 → 只有要翻頁時才回報
+  - 事件索引若比 checkpoint 慢,處理到最新會永久漏掉那幾秒的成交 → 每輪只處理到最新往前 20 個 checkpoint(約 5 秒)
+- 測試 87 項通過;實際建立、接續、`paper list` 都正常,測試用的模擬盤已刪除
+
+## 2026-10-29(SUI 回測)
+- 使用者想改跑 SUI。SUI 在自己的 Sui 鏈(非 EVM),主要 DEX 是 Cetus;使用者選擇先只做回測
+- `data.py` 新增 `CHAINS`(base / sui 的預設池子、代幣、gas)與 `check_ids`:Sui 池子是物件 ID,代幣是 coin type(`0x2::sui::SUI`)
+- `backtest / scan / walk` 加 `--chain`,預設仍是 base;Sui 預設 Cetus USDC/SUI 0.05%(TVL 約 110 萬美元)、gas $0.01;`--live-impact` 只支援 Base
+- coin type 含 `::`,URL 參數要編碼;快取檔名把 `:` 換掉,Base 沿用舊檔名
+- 價格低於 $100 時顯示 4 位小數,否則 SUI(約 $0.9)的格線全都會顯示成同一個數字
+- 實測:SUI 30 天跌 21%,±20% 20 格網格 −11.1%;120 天 walk +16.1% vs 持有 +32.2%(有 1 根異常 K 線)
+- 測試 78 項通過
+
 ## 2026-10-28(發佈到 GitHub)
 - 建立公開 repo https://github.com/qscgy5713/defi-grid,remote 用 SSH;推送前檢查過沒有金鑰或個人資料,`paper/`、`cache/` 不上傳
 - README 安裝步驟改成 `git clone`(用 HTTPS 網址,未設定 SSH 金鑰的人也能下載)

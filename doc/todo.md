@@ -8,7 +8,7 @@
 - [x] 網格模擬(等差 / 等比、成本、路徑假設)
 - [x] `economics` 損益估算與兩平格距
 - [x] CLI:pool / gas / economics / backtest
-- [x] 單元測試 75 項(模擬盤增量 = 回測、帳務恆等式、單循環精確比對、浮點回歸、輸入驗證、滾動視窗、快取、LP 數學、Swap 解碼)
+- [x] 單元測試 87 項(模擬盤增量 = 回測、帳務恆等式、單循環精確比對、浮點回歸、輸入驗證、滾動視窗、快取、LP 數學、Swap 解碼)
 - [x] 用真實鏈上資料與 42 天歷史實跑驗證
 
 ## 之後
@@ -19,6 +19,8 @@
 - [x] 鏈上 Swap 事件:`swaps` 指令,用逐筆成交校驗小時 K 線的路徑假設(最多 48 小時)
 - [x] LP 集中流動性模擬:`lp` 指令,和網格、持有幣比較
 - [x] L1 資料費:`gas` 指令讀 GasPriceOracle(實測遠小於 1 美分)
+- [x] SUI 回測:`backtest / scan / walk --chain sui`(Sui 鏈 Cetus USDC/SUI 0.05%,只用 K 線)
+- [x] SUI 即時模擬盤:`paper run --chain sui`(Sui GraphQL 讀 Cetus SwapEvent,停機最多補抓 2 小時)
 - [ ] LP 手續費改用歷史流動性(目前固定用現在的值)
 - [x] 即時模擬盤:`paper run / status / list`,用鏈上逐筆成交推進,斷點接續
 - [ ] 階段 3:測試網執行器(假幣、對帳)
